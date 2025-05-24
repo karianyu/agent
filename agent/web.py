@@ -259,10 +259,17 @@ def get_metrics():
             try:
                 metrics = get_metrics(name, rq_port)
                 benches_metrics.append(metrics)
-            except RedisConnectionError as e:
-                # This is to specifically catch the error on old benches that had their
-                # configs updated to render rq_port but the container doesn't actually
-                # expose the rq_port
+            except RedisConnectionError:
+                """
+                Ignore RedisConnectionError, don't log it
+
+                Two Reasons -
+                1. Bench is not running, so we miss the metrics
+                2. By mistake, we have pushed `rq_port` to many config while bench update, that means we
+                    don't have open port for this bench
+                """
+                pass
+            except Exception as e:
                 log.error(f"Failed to get metrics for {name} on port {rq_port}: {e}")
 
     return Response(benches_metrics, mimetype="text/plain")
@@ -272,26 +279,6 @@ def get_metrics():
 @validate_bench
 def get_bench(bench):
     return Server().benches[bench].dump()
-
-
-@application.route("/benches/<string:bench_str>/metrics", methods=["GET"])
-def get_bench_metrics(bench_str):
-    from agent.exporter import get_metrics
-
-    bench = Server().benches[bench_str]
-    rq_port = bench.bench_config.get("rq_port")
-    if rq_port:
-        try:
-            res = get_metrics(bench_str, rq_port)
-        except RedisConnectionError as e:
-            # This is to specifically catch the error on old benches that had their
-            # configs updated to render rq_port but the container doesn't actually
-            # expose the rq_port
-            log.error(f"Failed to get metrics for {bench_str} on port {rq_port}: {e}")
-        else:
-            return Response(res, mimetype="text/plain")
-
-    return Response("Unavailable", status=400, mimetype="text/plain")
 
 
 @application.route("/benches/<string:bench>/info", methods=["POST", "GET"])
@@ -995,7 +982,7 @@ def proxy_add_host():
         data["name"],
         data["target"],
         data["certificate"],
-        data.get("skip_reload", False),
+        data.get("skip_reload", True),
     )
     return {"job": job}
 
@@ -1049,14 +1036,14 @@ def proxy_rename_upstream(upstream):
 @application.route("/proxy/upstreams/<string:upstream>/sites", methods=["POST"])
 def proxy_add_upstream_site(upstream):
     data = request.json
-    job = Proxy().add_site_to_upstream_job(upstream, data["name"], data.get("skip_reload", False))
+    job = Proxy().add_site_to_upstream_job(upstream, data["name"], data.get("skip_reload", True))
     return {"job": job}
 
 
 @application.route("/proxy/upstreams/<string:upstream>/domains", methods=["POST"])
 def proxy_add_upstream_site_domain(upstream):
     data = request.json
-    job = Proxy().add_domain_to_upstream_job(upstream, data["domain"], data.get("skip_reload", False))
+    job = Proxy().add_domain_to_upstream_job(upstream, data["domain"], data.get("skip_reload", True))
     return {"job": job}
 
 
@@ -1066,7 +1053,9 @@ def proxy_add_upstream_site_domain(upstream):
 )
 def proxy_remove_upstream_site(upstream, site):
     data = request.json
-    job = Proxy().remove_site_from_upstream_job(upstream, site, data.get("skip_reload", False))
+    job = Proxy().remove_site_from_upstream_job(
+        upstream, site, data.get("skip_reload", True), data.get("extra_domains", [])
+    )
     return {"job": job}
 
 
@@ -1081,7 +1070,7 @@ def proxy_rename_upstream_site(upstream, site):
         data["domains"],
         site,
         data["new_name"],
-        data.get("skip_reload", False),
+        data.get("skip_reload", True),
     )
     return {"job": job}
 
@@ -1093,7 +1082,7 @@ def proxy_rename_upstream_site(upstream, site):
 def update_site_status(upstream, site):
     data = request.json
     job = Proxy().update_site_status_job(
-        upstream, site, data["status"], data.get("skip_reload", False), data.get("extra_domains", [])
+        upstream, site, data["status"], data.get("skip_reload", True), data.get("extra_domains", [])
     )
     return {"job": job}
 
@@ -1221,6 +1210,13 @@ def purge_binlog():
 @application.route("/database/binlogs/list", methods=["GET"])
 def get_binlogs():
     return jsonify(DatabaseServer().get_binlogs())
+
+
+@application.route("/database/binlogs/upload", methods=["POST"])
+def upload_binlogs_to_s3():
+    data = request.json
+    job = DatabaseServer().upload_binlogs_to_s3_job(**data)
+    return {"job": job}
 
 
 @application.route("/database/binlogs/indexer/add", methods=["POST"])
