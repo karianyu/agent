@@ -400,6 +400,18 @@ class Server(Base):
             command, directory=directory, skip_output_log=skip_output_log, non_zero_throw=non_zero_throw
         )
 
+    @job("Pull Docker Images", priority="high")
+    def pull_docker_images(self, image_tags: list[str], registry: dict[str, str]) -> None:
+        self._pull_docker_images(image_tags, registry)
+
+    @step("Pull Docker Images")
+    def _pull_docker_images(self, image_tags: list[str], registry: dict[str, str]) -> None:
+        self.docker_login(registry)
+
+        for image_tag in image_tags:
+            command = f"docker pull {image_tag}"
+            self.execute(command, directory=self.directory)
+
     @job("Reload NGINX")
     def restart_nginx(self):
         return self.reload_nginx()
@@ -544,6 +556,11 @@ class Server(Base):
             for worker_id in supervisor_status.get("worker", {}):
                 self.execute(f"sudo supervisorctl stop agent:worker-{worker_id}", non_zero_throw=False)
 
+        # Stop NGINX Reload Manager if it's a proxy server
+        is_proxy_server = self.config.get("domain") and self.config.get("name").startswith("n")
+        if is_proxy_server:
+            self.execute("sudo supervisorctl stop agent:nginx_reload_manager", non_zero_throw=False)
+
         # Stop redis
         if restart_redis and supervisor_status.get("redis") == "RUNNING":
             self.execute("sudo supervisorctl stop agent:redis", non_zero_throw=False)
@@ -554,6 +571,10 @@ class Server(Base):
         supervisor_status = get_supervisor_processes_status()
         if restart_redis or supervisor_status.get("redis") != "RUNNING":
             self.execute("sudo supervisorctl start agent:redis")
+
+        # Start NGINX Reload Manager if it's a proxy server
+        if is_proxy_server:
+            self.execute("sudo supervisorctl start agent:nginx_reload_manager")
 
         if restart_rq_workers:
             for i in range(self.config["workers"]):
@@ -763,17 +784,21 @@ class Server(Base):
 
     def _generate_supervisor_config(self):
         supervisor_config = os.path.join(self.directory, "supervisor.conf")
+        data = {
+            "web_port": self.config["web_port"],
+            "redis_port": self.config["redis_port"],
+            "gunicorn_workers": self.config.get("gunicorn_workers", 2),
+            "workers": self.config["workers"],
+            "directory": self.directory,
+            "user": self.config["user"],
+            "sentry_dsn": self.config.get("sentry_dsn"),
+        }
+        if self.config.get("name").startswith("n"):
+            data["is_proxy_server"] = True
+
         self._render_template(
             "agent/supervisor.conf.jinja2",
-            {
-                "web_port": self.config["web_port"],
-                "redis_port": self.config["redis_port"],
-                "gunicorn_workers": self.config.get("gunicorn_workers", 2),
-                "workers": self.config["workers"],
-                "directory": self.directory,
-                "user": self.config["user"],
-                "sentry_dsn": self.config.get("sentry_dsn"),
-            },
+            data,
             supervisor_config,
         )
 

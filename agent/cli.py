@@ -206,26 +206,6 @@ def usage():
 
 
 @setup.command()
-def nginx_defer_reload():
-    from crontab import CronTab
-
-    script_directory = os.path.dirname(__file__)
-    agent_directory = os.path.dirname(os.path.dirname(script_directory))
-    logs_directory = os.path.join(agent_directory, "logs")
-    script = os.path.join(script_directory, "nginx_defer_reload.py")
-    stdout = os.path.join(logs_directory, "nginx_defer_reload.log")
-    stderr = os.path.join(logs_directory, "nginx_defer_reload.error.log")
-
-    cron = CronTab(user=True)
-    command = f"cd {agent_directory} && {sys.executable} {script} 1>> {stdout} 2>> {stderr}"
-
-    if command not in str(cron):
-        job = cron.new(command=command)
-        job.minute.every(2)
-        cron.write()
-
-
-@setup.command()
 def registry():
     Server().setup_registry()
 
@@ -308,11 +288,15 @@ def bench():
 
 
 @bench.command()
-@click.argument("bench", required=False)
-def start(bench):
+@click.argument("bench", nargs=-1)
+def start(bench: tuple[str]):
+    server = Server()
+
     if bench:
-        return Server().benches[bench].start()
-    return Server().start_all_benches()
+        for b in bench:
+            server.benches[b].start()
+    else:
+        server.start_all_benches()
 
 
 @bench.command()
