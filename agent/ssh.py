@@ -20,8 +20,8 @@ class SSHProxy(Server):
         self.job = None
         self.step = None
 
-    def docker_execute(self, command):
-        command = f"docker exec ssh {command}"
+    def docker_execute(self, command, container=None):
+        command = f"docker exec -d {container} ssh {command}"
         return self.execute(command)
 
     @job("Add User to Proxy")
@@ -32,7 +32,7 @@ class SSHProxy(Server):
 
     @step("Add User to Proxy")
     def add_user(self, name):
-        return self.docker_execute(f"useradd -m -p '*' {name}")
+        return self.docker_execute(f"useradd -m -p '*'",container=name)
 
     @step("Add Certificate to User")
     def add_certificate(self, name, certificate):
