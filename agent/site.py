@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import time
 from datetime import datetime
 from shlex import quote
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import requests
 
@@ -47,6 +49,7 @@ class Site(Base):
         self.user = self.config["db_name"]
         self.password = self.config["db_password"]
         self.host = self.config.get("db_host", self.bench.host)
+        self.db_port = self.config.get("db_port", self.bench.db_port)
 
     def bench_execute(self, command, input=None):
         return self.bench.docker_execute(f"bench --site {self.name} {command}", input=input)
@@ -99,7 +102,7 @@ class Site(Base):
         return self.bench_execute(f"uninstall-app {app} --yes --force")
 
     @step("Restore Site")
-    def restore(
+    def restore_site(
         self,
         mariadb_root_password,
         admin_password,
@@ -130,6 +133,39 @@ class Site(Base):
             )
         finally:
             self.bench.drop_mariadb_user(self.name, mariadb_root_password, self.database)
+
+    @step("Restore Files")
+    def restore_files(
+        self,
+        public_file=None,
+        private_file=None,
+    ):
+        """Restore files from the given paths."""
+        sites_directory = self.bench.sites_directory
+
+        if public_file:
+            dir_path = os.path.join(sites_directory, self.name, "public", "files")
+            try:
+                shutil.rmtree(dir_path, ignore_errors=True)
+            finally:
+                os.makedirs(dir_path, exist_ok=True)
+
+            self.execute(
+                f"tar {'z' if public_file.endswith('.tgz') else ''}xvf {public_file} --strip 2",
+                directory=os.path.join(sites_directory, self.name),
+            )
+
+        if private_file:
+            dir_path = os.path.join(sites_directory, self.name, "private", "files")
+            try:
+                shutil.rmtree(dir_path, ignore_errors=True)
+            finally:
+                os.makedirs(dir_path, exist_ok=True)
+
+            self.execute(
+                f"tar {'z' if private_file.endswith('.tgz') else ''}xvf {private_file} --strip 2",
+                directory=os.path.join(sites_directory, self.name),
+            )
 
     @step("Checksum of Downloaded Backup Files")
     def calculate_checksum_of_backup_files(self, database_file, public_file, private_file):
@@ -163,26 +199,36 @@ class Site(Base):
         skip_failing_patches,
     ):
         files = self.bench.download_files(self.name, database, public, private)
+        is_database_restoration_required = False
         try:
-            self.restore(
-                mariadb_root_password,
-                admin_password,
-                files["database"],
-                files["public"],
-                files["private"],
-            )
+            if files["database"]:
+                is_database_restoration_required = True
+                self.restore_site(
+                    mariadb_root_password,
+                    admin_password,
+                    files["database"],
+                    files["public"],
+                    files["private"],
+                )
+            else:
+                self.restore_files(
+                    public_file=files["public"],
+                    private_file=files["private"],
+                )
         except Exception:
             self.calculate_checksum_of_backup_files(files["database"], files["public"], files["private"])
             raise
         finally:
             self.bench.delete_downloaded_files(files["directory"])
-        self.uninstall_unavailable_apps(apps)
-        self.migrate(skip_failing_patches=skip_failing_patches)
-        self.set_admin_password(admin_password)
-        self.enable_scheduler()
 
-        self.bench.setup_nginx()
-        self.bench.server.reload_nginx()
+        if is_database_restoration_required:
+            self.uninstall_unavailable_apps(apps)
+            self.migrate(skip_failing_patches=skip_failing_patches)
+            self.set_admin_password(admin_password)
+            self.enable_scheduler()
+
+            self.bench.setup_nginx()
+            self.bench.server.reload_nginx()
 
         return self.bench_execute("list-apps")
 
@@ -275,7 +321,7 @@ class Site(Base):
             "FLUSH PRIVILEGES",
         ]
         for query in queries:
-            command = f'mysql -h {self.host} -uroot -p{mariadb_root_password} -e "{query}"'
+            command = f'mysql -h {self.host} -P {self.db_port} -uroot -p{mariadb_root_password} -e "{query}"'
             self.execute(command)
         return {"database": database, "user": user, "password": password}
 
@@ -348,7 +394,7 @@ class Site(Base):
             output = self.execute(
                 "set -o pipefail && "
                 f"gunzip -c '{backup_file_path}' | "
-                f"mysql -h {self.host} -u {self.user} -p{self.password} "
+                f"mysql -h {self.host} -P {self.db_port} -u {self.user} -p{self.password} "
                 f"{self.database}",
                 executable="/bin/bash",
             )
@@ -395,12 +441,14 @@ class Site(Base):
     @step("Reset Site Usage")
     def reset_site_usage(self):
         pattern = f"{self.database}|rate-limit-counter-[0-9]*"
-        keys_command = f"redis-cli --raw -p 13000 KEYS '{pattern}'"
+        password = urlparse(self.bench.config.get("redis_cache")).password
+        password_arg = f"-a '{password}'" if password else ""
+        keys_command = f"redis-cli --raw -p 13000 {password_arg} KEYS '{pattern}'"
         keys = self.bench.docker_execute(keys_command)
         data = {"keys": keys, "get": [], "delete": []}
         for key in keys["output"].splitlines():
-            get = self.bench.docker_execute(f"redis-cli -p 13000 GET '{key}'")
-            delete = self.bench.docker_execute(f"redis-cli -p 13000 DEL '{key}'")
+            get = self.bench.docker_execute(f"redis-cli -p 13000 {password_arg} GET '{key}'")
+            delete = self.bench.docker_execute(f"redis-cli -p 13000 {password_arg} DEL '{key}'")
             data["get"].append(get)
             data["delete"].append(delete)
         return data
@@ -420,38 +468,47 @@ class Site(Base):
         return self.fetch_latest_backup(with_files=with_files)
 
     @step("Upload Site Backup to S3")
-    def upload_offsite_backup(self, backup_files, offsite):
+    def upload_offsite_backup(self, backup_files, offsite, keep_files_locally_after_offsite_backup: bool):
         import boto3
 
+        endpoint_url = "http://10.10.1.202:3900"
         offsite_files = {}
-        bucket, auth, prefix = (
-            offsite["bucket"],
-            offsite["auth"],
-            offsite["path"],
-        )
-        region = auth.get("REGION")
-
-        if region:
-            s3 = boto3.client(
-                "s3",
-                aws_access_key_id=auth["ACCESS_KEY"],
-                aws_secret_access_key=auth["SECRET_KEY"],
-                region_name=region,
+        try:
+            bucket, auth, prefix = (
+                offsite["bucket"],
+                offsite["auth"],
+                offsite["path"],
             )
-        else:
-            s3 = boto3.client(
-                "s3",
-                aws_access_key_id=auth["ACCESS_KEY"],
-                aws_secret_access_key=auth["SECRET_KEY"],
-            )
+            region = auth.get("REGION")
 
-        for backup_file in backup_files.values():
-            file_name = backup_file["file"].split(os.sep)[-1]
-            offsite_path = os.path.join(prefix, file_name)
-            offsite_files[file_name] = offsite_path
+            if region:
+                s3 = boto3.client(
+                    "s3",
+                    aws_access_key_id=auth["ACCESS_KEY"],
+                    aws_secret_access_key=auth["SECRET_KEY"],
+                    region_name=region,
+                    endpoint_url= endpoint_url,
+                )
+            else:
+                s3 = boto3.client(
+                    "s3",
+                    aws_access_key_id=auth["ACCESS_KEY"],
+                    aws_secret_access_key=auth["SECRET_KEY"],
+                    endpoint_url= endpoint_url,
+                )
 
-            with open(backup_file["path"], "rb") as data:
-                s3.upload_fileobj(data, bucket, offsite_path)
+            for backup_file in backup_files.values():
+                file_name = backup_file["file"].split(os.sep)[-1]
+                offsite_path = os.path.join(prefix, file_name)
+                offsite_files[file_name] = offsite_path
+
+                with open(backup_file["path"], "rb") as data:
+                    s3.upload_fileobj(data, bucket, offsite_path)
+        finally:
+            if not keep_files_locally_after_offsite_backup:
+                for backup_file in backup_files.values():
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(backup_file["path"])
 
         return offsite_files
 
@@ -468,7 +525,7 @@ class Site(Base):
 
     @step("Wait for Enqueued Jobs")
     def wait_till_ready(self):
-        WAIT_TIMEOUT = 600
+        WAIT_TIMEOUT = 300
         data = {"tries": []}
         start = time.time()
         is_ready = False
@@ -508,7 +565,7 @@ class Site(Base):
             output = self.execute(
                 "set -o pipefail && "
                 "mysqldump --single-transaction --quick --lock-tables=false "
-                f"-h {self.host} -u {self.user} -p{self.password} "
+                f"-h {self.host} -P {self.db_port} -u {self.user} -p{self.password} "
                 f"{self.database} '{table}' "
                 f" | gzip > '{backup_file}'",
                 executable="/bin/bash",
@@ -595,7 +652,7 @@ class Site(Base):
                 output = self.execute(
                     "set -o pipefail && "
                     f"gunzip -c '{backup_file}' | "
-                    f"mysql -h {self.host} -u {self.user} -p{self.password} "
+                    f"mysql -h {self.host} -P {self.db_port} -u {self.user} -p{self.password} "
                     f"{self.database}",
                     executable="/bin/bash",
                 )
@@ -610,7 +667,7 @@ class Site(Base):
         data = {"dropped": {}}
         for table in new_tables:
             output = self.execute(
-                f"mysql -h {self.host} -u {self.user} -p{self.password} "
+                f"mysql -h {self.host} -P {self.db_port} -u {self.user} -p{self.password} "
                 f"{self.database} -e 'DROP TABLE `{table}`'"
             )
             data["dropped"][table] = output
@@ -627,6 +684,24 @@ class Site(Base):
     @step("Resume Scheduler")
     def resume_scheduler(self):
         return self.bench_execute("scheduler resume")
+
+    @job("Fix global search")
+    def fix_global_search(self):
+        self.truncate_global_search()
+        self.rebuild_global_search()
+
+    @step("Truncate Global Search Table")
+    def truncate_global_search(self):
+        return self.run_sql_query("TRUNCATE TABLE __global_search", commit=True, as_dict=False)
+
+    @step("Rebuild global search")
+    def rebuild_global_search_step(self):
+        import json
+
+        """Execute bench rebuild-global-search command."""
+        result = self.bench_execute("rebuild-global-search")
+
+        return {"output": json.dumps(result)}
 
     def fetch_site_status(self):
         data = {
@@ -699,7 +774,7 @@ print(">>>" + frappe.session.sid + "<<<")
         )
         try:
             timezone = self.execute(
-                f"mysql -h {self.host} -u{self.database} -p{self.password} "
+                f"mysql -h {self.host} -P {self.db_port} -u{self.database} -p{self.password} "
                 f'--connect-timeout 3 -sN -e "{query}"'
             )["output"].strip()
         except Exception:
@@ -710,7 +785,7 @@ print(">>>" + frappe.session.sid + "<<<")
     def tables(self):
         return self.execute(
             "mysql --disable-column-names -B -e 'SHOW TABLES' "
-            f"-h {self.host} -u {self.user} -p{self.password} {self.database}"
+            f"-h {self.host} -P {self.db_port} -u {self.user} -p{self.password} {self.database}"
         )["output"].split("\n")
 
     @property
@@ -731,10 +806,14 @@ print(">>>" + frappe.session.sid + "<<<")
             return self.previous_tables
 
     @job("Backup Site", priority="low")
-    def backup_job(self, with_files=False, offsite=None):
+    def backup_job(
+        self, with_files=False, offsite=None, keep_files_locally_after_offsite_backup: bool = False
+    ):
         backup_files = self.backup(with_files)
         uploaded_files = (
-            self.upload_offsite_backup(backup_files, offsite) if (offsite and backup_files) else {}
+            self.upload_offsite_backup(backup_files, offsite, keep_files_locally_after_offsite_backup)
+            if (offsite and backup_files)
+            else {}
         )
         return {"backups": backup_files, "offsite": uploaded_files}
 
@@ -748,7 +827,8 @@ print(">>>" + frappe.session.sid + "<<<")
         for table in tables:
             query = f"OPTIMIZE TABLE `{table}`"
             self.execute(
-                f"mysql -sN -h {self.host} -u{self.user} -p{self.password} {self.database} -e '{query}'"
+                f"mysql -sN -h {self.host} -P {self.db_port} "
+                f"-u{self.user} -p{self.password} {self.database} -e '{query}'"
             )
 
     def fetch_latest_backup(self, with_files=True):
@@ -803,18 +883,29 @@ print(">>>" + frappe.session.sid + "<<<")
         return json.loads(analytics)
 
     def get_database_size(self):
-        # only specific to mysql/mariaDB. use a different query for postgres.
-        # or try using frappe.db.get_database_size if possible
-        query = (
-            "SELECT SUM(`data_length` + `index_length`)"
-            " FROM information_schema.tables"
-            f' WHERE `table_schema` = "{self.database}"'
-            " GROUP BY `table_schema`"
-        )
-        command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e '{query}'"
-        database_size = self.execute(command).get("output")
-
         try:
+            query = f'SELECT size FROM press_meta.schema_sizes WHERE `schema` = "{self.database}"'
+            command = f"mysql -sN -h {self.host} -P {self.db_port} \
+                -u{self.user} -p{self.password} -e '{query}'"
+            database_size = self.execute(command).get("output")
+        except Exception:
+            # Fallback to old way if press_meta is not available
+            try:
+                # only specific to mysql/mariaDB. use a different query for postgres.
+                # or try using frappe.db.get_database_size if possible
+                query = (
+                    "SELECT SUM(`data_length` + `index_length`)"
+                    " FROM information_schema.tables"
+                    f' WHERE `table_schema` = "{self.database}"'
+                    " GROUP BY `table_schema`"
+                )
+                command = f"mysql -sN -h {self.host} -P {self.db_port} \
+                    -u{self.user} -p{self.password} -e '{query}'"
+                database_size = self.execute(command).get("output")
+            except Exception as e:
+                raise e
+        try:
+            assert database_size is not None, "Could not fetch database size"
             return int(database_size)
         except Exception:
             return 0
@@ -834,7 +925,11 @@ print(">>>" + frappe.session.sid + "<<<")
 
     @property
     def apps(self):
-        return self.bench_execute("list-apps")["output"]
+        return self.bench_execute("execute frappe.get_installed_apps")["output"]
+
+    @property
+    def apps_as_json(self):
+        return json.loads(self.bench_execute("list-apps -f json")["output"])[self.name]
 
     @job("Add Database Index")
     def add_database_index(self, doctype, columns=None):
@@ -857,7 +952,7 @@ print(">>>" + frappe.session.sid + "<<<")
             f' WHERE `table_schema` = "{self.database}"'
             " GROUP BY `table_schema`"
         )
-        command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e '{query}'"
+        command = f"mysql -sN -h {self.host} -P {self.db_port} -u{self.user} -p{self.password} -e '{query}'"
         database_size = self.execute(command).get("output")
 
         try:
@@ -875,7 +970,9 @@ print(">>>" + frappe.session.sid + "<<<")
                 " AND ((`data_free` / (`data_length` + `index_length`)) > 0.2"
                 " OR `data_free` > 100 * 1024 * 1024)"
             )
-            command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e '{query}'"
+            command = (
+                f"mysql -sN -h {self.host} -P {self.db_port} -u{self.user} -p{self.password} -e '{query}'"
+            )
             output = self.execute(command).get("output")
             return [line.split("\t") for line in output.splitlines()]
         except Exception:
@@ -962,7 +1059,7 @@ print(">>>" + frappe.session.sid + "<<<")
             username = self.user
         if not password:
             password = self.password
-        return Database(self.host, 3306, username, password, self.database)
+        return Database(self.host, self.db_port, username, password, self.database)
 
     @property
     def job_record(self):
