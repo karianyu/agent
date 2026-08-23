@@ -471,8 +471,11 @@ class Bench(Base):
         ]:
             self.execute(f'{mysql} -e "{query}"')
 
+        # Same skeleton `bench new-site` lays down, the old bench took the site's copy with it
         directory = os.path.join(self.sites_directory, name)
-        os.makedirs(directory, exist_ok=True)
+        for path in ["public/files", "private/backups", "private/files", "locks", "logs"]:
+            os.makedirs(os.path.join(directory, path), exist_ok=True)
+
         with open(os.path.join(directory, "site_config.json"), "w") as f:
             json.dump({"db_name": database, "db_password": password}, f, indent=1)
 
