@@ -463,13 +463,24 @@ class Bench(Base):
         if database not in databases:
             raise Exception(f"Database {database} does not exist on {self.host}")
 
-        # The site's old password is gone with its bench, root sets a new one
-        for query in [
-            f"CREATE OR REPLACE USER '{database}'@'%' IDENTIFIED BY '{password}'",
-            f"GRANT ALL ON {database}.* TO '{database}'@'%'",
-            "FLUSH PRIVILEGES",
-        ]:
-            self.execute(f'{mysql} -e "{query}"')
+        # The site's old password went with its bench, root sets a new one. Every host entry of the
+        # user has to get it: MariaDB matches the most specific host, so an entry we skipped would
+        # keep answering with the old password
+        output = self.execute(f"{mysql} -N -e \"SELECT Host FROM mysql.user WHERE User = '{database}'\"")[
+            "output"
+        ]
+        # mysql warns about passwords on the command line, that line has spaces, host names don't
+        hosts = {line.strip() for line in output.splitlines() if line.strip() and " " not in line.strip()}
+
+        for host in hosts | {"%"}:
+            for query in [
+                f"CREATE USER IF NOT EXISTS '{database}'@'{host}' IDENTIFIED BY '{password}'",
+                f"ALTER USER '{database}'@'{host}' IDENTIFIED BY '{password}'",
+                f"GRANT ALL ON {database}.* TO '{database}'@'{host}'",
+            ]:
+                self.execute(f'{mysql} -e "{query}"')
+
+        self.execute(f'{mysql} -e "FLUSH PRIVILEGES"')
 
         # Same skeleton `bench new-site` lays down, the old bench took the site's copy with it
         directory = os.path.join(self.sites_directory, name)
