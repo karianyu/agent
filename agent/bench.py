@@ -426,6 +426,58 @@ class Bench(Base):
 
         return site.bench_execute("list-apps")
 
+    @job("New Site from Backup", priority="high")
+    def new_site_from_existing_database(
+        self,
+        name,
+        config,
+        apps,
+        mariadb_root_password,
+        admin_password,
+        database,
+        skip_failing_patches,
+    ):
+        """Bring a site back on this bench using the database it already has on the database server.
+
+        Used when a site's bench is gone but its database isn't, so there's nothing to restore.
+        """
+        # ponytail: same job name as the backup restore, so press's New Site callbacks apply as is
+        password = self.get_random_string(16)
+        self.attach_existing_database(name, database, password, mariadb_root_password)
+        site = Site(name, self)
+        site.update_config({**config, "db_name": database, "db_password": password})
+        site.uninstall_unavailable_apps(apps)
+        site.migrate(skip_failing_patches=skip_failing_patches)
+        site.set_admin_password(admin_password)
+        site.enable_scheduler()
+        self.setup_nginx()
+        self.server.reload_nginx()
+
+        return site.bench_execute("list-apps")
+
+    @step("Attach Existing Database")
+    def attach_existing_database(self, name, database, password, mariadb_root_password):
+        """Create the site directory against an existing database instead of creating a new one."""
+        mysql = f"mysql -h {self.host} -uroot -p{mariadb_root_password}"
+        databases = self.execute(f"{mysql} -e \"SHOW DATABASES LIKE '{database}'\"")["output"]
+        if database not in databases:
+            raise Exception(f"Database {database} does not exist on {self.host}")
+
+        # The site's old password is gone with its bench, root sets a new one
+        for query in [
+            f"CREATE OR REPLACE USER '{database}'@'%' IDENTIFIED BY '{password}'",
+            f"GRANT ALL ON {database}.* TO '{database}'@'%'",
+            "FLUSH PRIVILEGES",
+        ]:
+            self.execute(f'{mysql} -e "{query}"')
+
+        directory = os.path.join(self.sites_directory, name)
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "site_config.json"), "w") as f:
+            json.dump({"db_name": database, "db_password": password}, f, indent=1)
+
+        return {"site": name, "database": database}
+
     @step("Archive Site")
     def bench_archive_site(self, name, mariadb_root_password, force):
         site_database, temp_user, temp_password = self.create_mariadb_user(

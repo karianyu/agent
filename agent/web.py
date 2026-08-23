@@ -470,6 +470,27 @@ def new_site_from_backup(bench):
     return {"job": job}
 
 
+@application.route("/benches/<string:bench>/sites/attach", methods=["POST"])
+@validate_bench
+def new_site_from_existing_database(bench):
+    data = request.json
+
+    job = (
+        Server()
+        .benches[bench]
+        .new_site_from_existing_database(
+            data["name"],
+            data["config"],
+            data["apps"],
+            data["mariadb_root_password"],
+            data["admin_password"],
+            data["database"],
+            data.get("skip_failing_patches", False),
+        )
+    )
+    return {"job": job}
+
+
 @application.route("/benches/<string:bench>/sites/<string:site>/restore", methods=["POST"])
 @validate_bench_and_site
 def restore_site(bench, site):
