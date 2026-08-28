@@ -16,7 +16,7 @@ import requests
 from agent.base import AgentException, Base
 from agent.database import Database
 from agent.job import job, step
-from agent.utils import b2mb, compute_file_hash, get_size
+from agent.utils import b2mb, compute_file_hash, get_s3_client, get_size
 
 if TYPE_CHECKING:
     from agent.bench import Bench
@@ -468,33 +468,10 @@ class Site(Base):
 
     @step("Upload Site Backup to S3")
     def upload_offsite_backup(self, backup_files, offsite, keep_files_locally_after_offsite_backup: bool):
-        import boto3
-
-        endpoint_url = "http://10.10.1.202:3900"
         offsite_files = {}
         try:
-            bucket, auth, prefix = (
-                offsite["bucket"],
-                offsite["auth"],
-                offsite["path"],
-            )
-            region = auth.get("REGION")
-
-            if region:
-                s3 = boto3.client(
-                    "s3",
-                    aws_access_key_id=auth["ACCESS_KEY"],
-                    aws_secret_access_key=auth["SECRET_KEY"],
-                    region_name=region,
-                    endpoint_url= endpoint_url,
-                )
-            else:
-                s3 = boto3.client(
-                    "s3",
-                    aws_access_key_id=auth["ACCESS_KEY"],
-                    aws_secret_access_key=auth["SECRET_KEY"],
-                    endpoint_url= endpoint_url,
-                )
+            bucket, prefix = offsite["bucket"], offsite["path"]
+            s3 = get_s3_client(offsite)
 
             for backup_file in backup_files.values():
                 file_name = backup_file["file"].split(os.sep)[-1]

@@ -218,3 +218,17 @@ def get_supervisor_processes_status() -> dict[str, str | dict[str, str]]:
         return dict(nested_status)
     except Exception:
         return {}
+
+
+def get_s3_client(offsite: dict):
+    """S3 client for an offsite payload. Falls back to AWS when press sends no custom endpoint."""
+    import boto3
+
+    auth = offsite["auth"]
+    return boto3.client(
+        "s3",
+        aws_access_key_id=auth["ACCESS_KEY"],
+        aws_secret_access_key=auth["SECRET_KEY"],
+        region_name=auth.get("REGION") or None,
+        endpoint_url=offsite.get("endpoint") or None,
+    )

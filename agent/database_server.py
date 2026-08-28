@@ -15,6 +15,7 @@ from peewee import MySQLDatabase
 from agent.database import Database
 from agent.job import job, step
 from agent.server import Server
+from agent.utils import get_s3_client
 
 
 class DatabaseServer(Server):
@@ -366,31 +367,11 @@ class DatabaseServer(Server):
 
     @step("Upload Binlogs To S3")
     def upload_binlogs_to_s3(self, binlogs: list[str], offsite):
-        import boto3
-
         offsite_files = {}
         failed_uploads = {}
 
-        bucket, auth, prefix = (
-            offsite["bucket"],
-            offsite["auth"],
-            offsite["path"],
-        )
-        region = auth.get("REGION")
-
-        if region:
-            s3 = boto3.client(
-                "s3",
-                aws_access_key_id=auth["ACCESS_KEY"],
-                aws_secret_access_key=auth["SECRET_KEY"],
-                region_name=region,
-            )
-        else:
-            s3 = boto3.client(
-                "s3",
-                aws_access_key_id=auth["ACCESS_KEY"],
-                aws_secret_access_key=auth["SECRET_KEY"],
-            )
+        bucket, prefix = offsite["bucket"], offsite["path"]
+        s3 = get_s3_client(offsite)
 
         tmp_folder = get_tmp_folder_path()
         for binlog in binlogs:
